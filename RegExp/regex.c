@@ -19,12 +19,11 @@
 typedef enum {
     P_UNKNOWN,
     P_BEGIN,                                    /*!< ^ indicating string must start with match */
-    P_STAR,                                     /*!< Match 0 or more times */
-    P_PLUS,                                     /*!< Match 1 or more times */
     P_QM,                                       /*!< Match 0 or 1 times */
     P_DOT,                                      /*!< Match any character */
     P_OR,                                       /*!< Branch (OR) operator */
     P_CHAR,                                     /*!< Match exact character */
+    P_CHAR_SEQUENCE,                            /*!< Sequence of literal characters */
     P_CHAR_CLASS,                               /*!< Character class to match */
     P_CHAR_CLASS_NOT,                           /*!< Character class not to match */
     P_END,                                      /*!< Match end of match */
@@ -44,6 +43,8 @@ typedef struct {
 #define PATTERNS_COUNT              100
 p_t patterns[PATTERNS_COUNT];
 
+#define RANGE_MAX                               (0x7FFF)
+
 /* List of internal functions */
 static uint8_t match_pattern(const p_t* p, const char* str);
 
@@ -53,7 +54,9 @@ static uint8_t match_pattern(const p_t* p, const char* str);
  * List of special character (s, f, w) values
  */
 #define IS_DIGIT(x)             ((x) >= '0' && (x) <= '9')
-#define IS_SPECIAL_CHAR(x)      ((x) == 's' || (x) == 'S' || (x) == 'w' || (x) == 'W' || (x) == 'd' || (x) == 'D')
+#define IS_SPECIAL_META_CHAR(x) ((x) == 's' || (x) == 'S' || (x) == 'w' || (x) == 'W' || (x) == 'd' || (x) == 'D')
+#define IS_SPECIAL_CHAR(x)      ((x) == '^' || (x) == '$' || (x) == '.' || (x) == '*' || (x) == '+' || (x) == '?' || (x) == '|' || (x) == '(' || (x) == ')' || (x) == '{' || (x) == '}' || (x) == '[' || (x) == '}')
+#define IS_SPECIAL_MOD_CHAR(x)  (IS_SPECIAL_CHAR(x) && !((x) == '[' || (x) == '(' || (x) == '|' || (x) == ']' || (x) == ')'))
 #define IS_S_CHAR(x)            ((x) == ' ' || (x) == '\n' || (x) == '\r' || (x) == '\t' || (x) == '\v' || (x) == '\f')
 #define IS_D_CHAR(x)            IS_DIGIT(x)
 #define IS_W_CHAR(x)            (((x) >= 'a' && (x) <= 'z') || ((x) >= 'A' && (x) <= 'Z') || ((x) >= '0' && (x) <= '9') || (x) == '_')
@@ -69,8 +72,8 @@ compile_pattern(const char* p, size_t len) {
             case '^': patterns[i].type = P_BEGIN; break;
             case '$': patterns[i].type = P_END; break;
             case '.': patterns[i].type = P_DOT; break;
-            case '*': patterns[i].type = P_STAR; break;
-            case '+': patterns[i].type = P_PLUS; break;
+            case '*': if (i > 0) { patterns[i - 1].min = 0; patterns[i - 1].max = RANGE_MAX; goto ignore; } break;
+            case '+': if (i > 0) { patterns[i - 1].min = 1; patterns[i - 1].max = RANGE_MAX; goto ignore; } break;
             case '?': patterns[i].type = P_QM; break;
             case '|': patterns[i].type = P_OR; break;
             case '(':
@@ -153,16 +156,38 @@ compile_pattern(const char* p, size_t len) {
                     }
                     switch (type) {             /* Check range type */
                         case 1: pattern->min = num1; pattern->max = num1; break;
-                        case 2: pattern->min = num1; pattern->max = 0x7FFF; break;
+                        case 2: pattern->min = num1; pattern->max = RANGE_MAX; break;
                         case 3: pattern->min = num1; pattern->max = num2; break;
                         default: return 0;
                     }
                     continue;
                 }
             };
-            default: {
-                patterns[i].type = P_CHAR;
-                patterns[i].ch = *p;
+            default: {                          /* Non special character */
+                if (!IS_SPECIAL_CHAR(p[1])) {   /* Is next one special character? */
+                    patterns[i].type = P_CHAR_SEQUENCE;
+                    patterns[i].str = p;        /* Set current pointer */
+                    patterns[i].len = 1;
+                    while ((len - 1) && *p) {   /* Process much as possible */
+                        /* All special one except '[' */
+                        if (IS_SPECIAL_MOD_CHAR(p[2])) {    /* In case second after current is special, stop with sequnce */
+                            break;
+                        }
+                        if (IS_SPECIAL_CHAR(p[1])) {    /* Check if next character is special one */
+                            break;
+                        }
+                        if (p[1] == '\\') {    /* Is next one escape character? */
+                            if (IS_SPECIAL_META_CHAR(p[2])) {   /* Is escape followed by meta character? */
+                                break;
+                            }
+                        }
+                        patterns[i].len++;      /* Increase length of char sequence */
+                        PTR_INC();              /* Go to next character */
+                    }
+                } else {
+                    patterns[i].type = P_CHAR;
+                    patterns[i].ch = *p;
+                }
             }
         }
         i++;
@@ -265,20 +290,30 @@ match_special_char(const p_t* p, char s_c, char c) {
 }
 
 /**
+ * \brief           Check for next pattern after current one
+ * \param[in]       p: Pointer to pattern being currently executed
+ * \param[in]       str: Pointer to source string to advance
+ */
+static uint8_t
+check_next_pattern(const p_t* p, const char* str, uint8_t result) {
+    return 0;
+}
+
+/**
  * \brief           Match character class such as [0-9] or [0-9a-zA-Z] or similar
  * \param[in]       p: Pointer to exact pattern with character class included
  * \param[in]       c: Character to test in character class
  * \return          1 if match, 0 otherwise
  */
 static uint8_t 
-match_class_char(const p_t* p, char c) {
+match_class_char(const p_t* p, const char* str) {
     size_t i;
     for (i = 0; i < p->len; i++) {              /* Process input group string */
         /**
          * Try to match range of character between 2 values, such as [0-9]
          * In case p->str[i] == '-', check if left and right are range values
          */
-        if (match_class_range(&p->str[i], p->len - i, c)) {
+        if (match_class_range(&p->str[i], p->len - i, *str)) {
             return 1;
         }
 
@@ -287,11 +322,11 @@ match_class_char(const p_t* p, char c) {
          */
         else if (p->str[i] == '\\') {
             i++;
-            if (IS_SPECIAL_CHAR(p->str[i])) {   /* Check special characters */
-                if (match_special_char(p, p->str[i], c)) {
+            if (IS_SPECIAL_META_CHAR(p->str[i])) {  /* Check special characters */
+                if (match_special_char(p, p->str[i], *str)) {
                     return 1;
                 }
-            } else if (p->str[i] == c) {        /* Maybe it was escaped direct character such as .+- */
+            } else if (p->str[i] == *str) {     /* Maybe it was escaped direct character such as .+- */
                 return 1;
             }
         }
@@ -301,15 +336,15 @@ match_class_char(const p_t* p, char c) {
          * - If '-' character is included to match directly, it must be either first or last written:
          *    - [0-9-] or [-0-9] is valid and will match any number or '-' sign
          */
-        else if (c == p->str[i]) {
-            if (c == '-') {                     /* In case '-' is input character */
+        else if (*str == p->str[i]) {
+            if (*str == '-') {                  /* In case '-' is input character */
                 return (p->str[0] == '-' || p->str[p->len - 1] == '-'); /* Check if it is first or last on char class */
             } else {                            /* Any other character */
                 return 1;                       /* We have a match */
             }
         }
     }
-    return 0;
+    return check_next_pattern(p, str, 0);       /* Proceed with next pattern if possible */
 }
 
 /**
@@ -319,60 +354,56 @@ match_class_char(const p_t* p, char c) {
  * \return          1 if match, 0 otherwise
  */
 static uint8_t
-match_one_char(const p_t* p, char c) {
+match_one_char(const p_t* p, const char* str) {
     if (p->type == P_DOT) {                     /* Match any character */
         return 1;
     } else if (p->type == P_CHAR_CLASS) {       /* Match character class such [a-zA-Z0-9] */
-        return match_class_char(p, c);
+        return match_class_char(p, str);
     } else if (p->type == P_CHAR_CLASS_NOT) {   /* Match character class such as [^a-zA-Z0-9] */
-        return !match_class_char(p, c);
+        return !match_class_char(p, str);
     } else {                                    /* Compare characters directly */
-        return c == p->ch;
+        return *str == p->ch;
     }
     return 0;
 }
 
 /**
- * \brief           Match current pattern as STAR or PLUS
- * \note            Next pattern of \arg curr_p is either STAR or PLUS,
- *                  so to continue on next available pattern, use address curr_p + 2
- * \param[in]       curr_p: Pointer to current pattern to test against STAR or PLUS
- * \param[in]       str: Pointer to string to test
- * \param[in]       is_star: Status indicating we should test as STAR or PLUS
+ * \brief           Matches char sequence
+ * \param[in]       p: Pointer to current pattern holding char sequence
+ * \param[in]       str: Input string to match sequence
  * \return          1 if match, 0 otherwise
  */
 static uint8_t
-match_pattern_star_plus(const p_t* curr_p, const char* str, uint8_t is_star) {
-    if (is_star) {
-        /**
-         * Since we have to match 0 or more characters,
-         * we can directly check next pattern and current match is not required
-         */
-        do {
-            /** 
-             * Check next pattern if there is a match
-             */
-            if (match_pattern(curr_p + 2, str)) {   /* Check if next pattern has a match */
-                return 1;                       /* Simply stop execution */
-            }
-        } while (*str && match_one_char(curr_p, *str++));
-    } else {
-        /**
-         * Since we have to match at least one character,
-         * first check if this character matches of current pattern,
-         * then proceed to next one
-         */
-        while (*str && match_one_char(curr_p, *str++)) {
-            /**
-             * If we have a match at least once
-             * proceed with next pattern immediately
-             */
-            if (match_pattern(curr_p + 2, str)) {   /* Check if next pattern has a match */
-                return 1;                       /* Simply stop execution */
-            }
+match_char_sequence(const p_t* p, const char* str) {
+    size_t i;
+    const char* s = str;
+
+    /**
+     * go throught entire char sequence string and process:
+     *  - Check if end of matching string
+     *  - Check if we have escape string, in this case move to next one before compare
+     *  - Compare actual char by char and check if there is a match
+     */
+    for (i = 0; i < p->len; i++) {
+        if (!*s) {                              /* If source string is empty */
+            break;                              /* Stop execution immediatelly */
         }
+        if (p->str[i] == '\\') {                /* Check for escape string */
+            i++;                                /* Just move to next one */
+        }
+        if (*s != p->str[i]) {                  /* Compare actual string values */
+            break;                              /* Finish as they failed */
+        }
+        s++;                                    /* Go to next source */
     }
-    return 0;
+
+    /**
+     * If we have a match, proceed with next check
+     */
+    if (i == p->len) {                          /* All characters matched? */
+        return match_pattern(p + 1, s);         /* Continue with matched source */
+    }
+    return check_next_pattern(p, str, 0);       /* Possibly continue with original source */
 }
 
 /**
@@ -384,22 +415,24 @@ match_pattern_star_plus(const p_t* curr_p, const char* str, uint8_t is_star) {
 static uint8_t
 match_pattern_range(const p_t* p, const char* str) {
     int16_t cnt = 0;
+    const char* s = str;
     
     /**
      * Process entire string and check for matches
      */
-    while (cnt < p->max && *str && match_one_char(p, *str++)) {
+    while (cnt < p->max && *str && match_one_char(p, s)) {
         cnt++;
-        if ((p[1].type != P_END && p[1].type != P_EMPTY)) {
-            if (match_pattern(p + 1, str)) {
+        s++;
+        if (p[1].type != P_EMPTY) {
+            if (match_pattern(p + 1, s)) {
                 break;
             }
         }
     }
     if (cnt >= p->min && cnt <= p->max) {
-        return match_pattern(p + 1, str);
+        return (p[1].type != P_EMPTY) ? match_pattern(p + 1, s) : 1;
     }
-    return 0;
+    return check_next_pattern(p, str, 0);
 }
 
 /**
@@ -410,6 +443,7 @@ match_pattern_range(const p_t* p, const char* str) {
  */
 static uint8_t
 match_pattern(const p_t* p, const char* str) {
+    const char* s = str;
     do {
         /**
          * Check if there is no more patterns to match or
@@ -419,20 +453,18 @@ match_pattern(const p_t* p, const char* str) {
             return 1;                           /* We are done here */
         }
         /**
-         * In case next pattern is STAR,
-         * match current pattern acting like 0 or more matches
-         *
-         * In case next pattern is PLUS,
-         * match current pattern acting like 1 or more matches
+         * Check if we have to make sure about range of pattern
+         * 
+         * It matches STAR and PLUS patterns, set by pattern compilation
          */
-        else if (p[1].type == P_STAR || p[1].type == P_PLUS) {
-            return match_pattern_star_plus(p, str, p[1].type == P_STAR);    /* Match pattern as star or plus */
+        else if (p->min || p->max) {
+            return match_pattern_range(p, s);
         }
         /**
-        * Check if we have to make sure about range of pattern
-        */
-        else if (p->min || p->max) {
-            return match_pattern_range(p, str);
+         * Match exact char sequence between pattern and source string
+         */
+        else if (p[0].type == P_CHAR_SEQUENCE) {
+            return match_char_sequence(p, s);
         }
         /**
          * In case we have to end with specific match
@@ -440,17 +472,49 @@ match_pattern(const p_t* p, const char* str) {
          * In this case simply check if source string is NULL
          */
         else if (p[0].type == P_END && p[1].type == P_EMPTY) {
-            return !*str;                       /* Must be NULL terminated at this point */
+            return !*s;                         /* Must be NULL terminated at this point */
         }
         /**
          * Check if branch operator (OR) is used 
          * to match either left or right part of string
          */
         else if (p[1].type == P_OR) {
-            return match_pattern(&p[0], str) || match_pattern(&p[2], str);
+            return match_pattern(&p[2], s);
         }
-    } while (*str && match_one_char(p++, *str++));  /* Match single character with this pattern */
-    return 0;                                   /* No match at all found */
+    } while (*s && match_one_char(p++, s++));   /* Match single character with this pattern */
+    return check_next_pattern(p, s, 0);         /* No match at all found */
+}
+
+static void
+print_pattern(void) {
+    size_t i = 0, len;
+    for (; patterns[i].type != P_EMPTY; i++) {
+        switch (patterns[i].type) {
+            case P_CHAR_CLASS:
+            case P_CHAR_CLASS_NOT:
+                printf("Char class: \"");
+                for (len = 0; len < patterns[i].len; len++) {
+                    printf("%c", patterns[i].str[len]);
+                }
+                printf("\"\r\n");
+                break;
+            case P_CHAR_SEQUENCE:
+                printf("Char sequence: \"");
+                for (len = 0; len < patterns[i].len; len++) {
+                    printf("%c", patterns[i].str[len]);
+                }
+                printf("\"\r\n");
+                break;
+            case P_CHAR:
+                printf("Char: %c\r\n", patterns[i].ch);
+                break;
+            case P_OR:
+                printf("OR\r\n");
+                break;
+            default:
+                break;
+        }
+    }
 }
 
 /*
@@ -473,6 +537,8 @@ regex_match(const char* pattern, const char* str) {
     if (!compile_pattern(pattern, len)) {       /* Try to compile pattern */
         return 0;
     }
+
+    print_pattern();                            /* Print for debug purpose */
 
     /**
      * If pattern to start string at beginning was found, 
