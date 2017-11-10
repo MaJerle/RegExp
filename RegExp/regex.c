@@ -61,10 +61,10 @@
  * /\\d?/g                          Match digit 0 or 1 times
  * /[abc]/g                         Match character if it is 'a', 'b' or 'c'
  * /[^abc]/g                        Match character if it is NOT 'a', 'b' or 'c'
+ * /a(ab){1,2}c/g                   Match character 'a', followed by sequence "ab" between 1 or 2 times followed by character 'c' (Valid inputs: "aabc" or "aababc")
  *
  * Regular expression library will not work with these examples (behavior is undefined):
  *
- * /a(ab){1,2}c/g                   Match character 'a', followed by sequence "ab" between 1 or 2 times followed by character 'c'
  * /a(a|b|c(cd|ef))/g               Match character 'a', followed by either 'a', 'b' or ('c' followed by either 'cd' or 'ef')
  * /(ab|cd)+/g                      Match "ab" or "cd" strings 1 or more times
  *
@@ -75,42 +75,14 @@
  */
 
 /**
- * \brief           List of possible regex pattern types
- */
-typedef enum {
-    P_UNKNOWN,                                  /*!< Type is not known */
-    P_BEGIN,                                    /*!< ^ indicating string must start with match */
-    P_QM,                                       /*!< Match 0 or 1 times */
-    P_DOT,                                      /*!< Match any character */
-    P_OR,                                       /*!< Branch (OR) operator */
-    P_CHAR,                                     /*!< Match exact character */
-    P_CHAR_SEQUENCE,                            /*!< Sequence of literal characters */
-    P_CHAR_CLASS,                               /*!< Character class to match */
-    P_CHAR_CLASS_NOT,                           /*!< Character class not to match */
-    P_END,                                      /*!< Match end of string $ */
-    P_EMPTY                                     /*!< Indicate end of pattern */
-} p_type_t;
-
-/**
  * \brief           Single pattern entry
  */
-typedef struct {
-    union {
-        const char* str;                        /*!< Pointer to string in source pattern */
-        char ch;                                /*!< Character used for repetition */
-    };
-    uint8_t len;                                /*!< Length of string in source pattern, valid only if string is used */
-    p_type_t type;                              /*!< Pattern type */
-    int16_t min, max;                           /*!< Minimal or maximal readings */
-} p_t;
+typedef regex_pattern_t p_t;
 
 #define RANGE_MAX                               (0x7FFF)
 
-#define PATTERNS_COUNT              100
-p_t patterns[PATTERNS_COUNT];
-
 /* List of internal functions */
-static uint8_t match_pattern(const p_t* p, const char* str, uint8_t prev_result);
+static uint8_t match_pattern(regex_t* r, const p_t* p, const char* str, uint8_t prev_result);
 
 #define PTR_INC() do { p++, len = len > 0 ? len - 1 : 0; } while (0);
 
@@ -134,9 +106,13 @@ static uint8_t match_pattern(const p_t* p, const char* str, uint8_t prev_result)
  * \return          1 if compiled, 0 otherwise
  */
 static uint8_t
-compile_pattern(const char* p, size_t len) {
+compile_pattern(regex_t* r, const char* p, size_t len) {
     size_t i = 0;
+    p_t* patterns = r->p;
     while (len) {                               /* Process entire pattern char by char */
+        if (i >= r->p_totlen) {                 /* End of available patterns? */
+            return 0;                           /* Stop execution */
+        }
         memset(&patterns[i], 0x00, sizeof(patterns[0]));
         switch (*p) {
             case '^': patterns[i].type = P_BEGIN; break;
@@ -264,7 +240,8 @@ compile_pattern(const char* p, size_t len) {
 ignore:
         PTR_INC();
     }
-    patterns[i].type = P_EMPTY;
+    patterns[i].type = P_EMPTY;                 /* Last pattern is always empty */
+    r->m_len = i + 1;                           /* Set total length used */
     return 1;
 }
 
@@ -274,7 +251,7 @@ ignore:
  * \return          1 if ok, 0 otherwise
  */
 static uint8_t
-analyze_pattern(const char** pat, size_t* length) {
+analyze_pattern(regex_t* r, const char** pat, size_t* length) {
     size_t len;
     int8_t brackets;                            /* Number of round, square and curly brackets */
     const char* pattern = *pat;
@@ -317,31 +294,6 @@ analyze_pattern(const char** pat, size_t* length) {
 }
 
 /**
- * \brief           Check for next pattern after current one
- * \param[in]       p: Pointer to pattern being currently executed
- * \param[in]       str: Pointer to source string to advance
- * \param[in]       result: Status whether previous match was successful or not
- */
-static uint8_t
-check_next_pattern(const p_t* p, const char* str, uint8_t result) {
-    if (result) {                               /* Previous operation was OK */
-        if (p[1].type == P_OR) {                /* Is next one OR sequence? */
-            while (p[1].type == P_OR) {         /* Until next one is OR */
-                p += 2;                         /* Advance for 2 entries */
-            }
-        } else {                                /* No OR followed */
-            p++;                                /* Go to next entry */
-        }
-        return match_pattern(p, str, 1);        /* Match next one */
-    } else {                                    /* Previos operation was not successful */
-        if (p[1].type == P_OR) {                /* Is there OR operation followed? */
-            return match_pattern(&p[2], str, 0);/* Try sequence after OR */
-        }
-    }
-    return 0;
-}
-
-/**
  * \brief           Try to match if character is in range between 2 values
  * \param[in]       str: Pointer to string (not-null-terminated) with range
  * \param[in]       len: Length of string available to check
@@ -349,7 +301,7 @@ check_next_pattern(const p_t* p, const char* str, uint8_t result) {
  * \return          1 if match, 0 otherwise
  */
 static uint8_t
-match_class_range(const char* str, size_t len, const char* in_str) {
+match_class_range(regex_t* r, const char* str, size_t len, const char* in_str) {
     /**
      * To get a range match, we need:
      *  - Length of range string must be at least 3 characters
@@ -370,7 +322,7 @@ match_class_range(const char* str, size_t len, const char* in_str) {
  * \return          1 if match, 0 otherwise
  */
 static uint8_t
-match_special_char(const p_t* p, char s_c, const char* str) {
+match_special_char(regex_t* r, const p_t* p, char s_c, const char* str) {
     uint8_t result = 0;
     switch (IS_C_UPPER(s_c) ? s_c : s_c - 0x20) {   /* Process only lowercase letters */
         case 'S': result = IS_S_CHAR(*str); break;  /* Check for whitespace */
@@ -391,14 +343,14 @@ match_special_char(const p_t* p, char s_c, const char* str) {
  * \return          1 if match, 0 otherwise
  */
 static uint8_t 
-match_class_char(const p_t* p, const char* str) {
+match_class_char(regex_t* r, const p_t* p, const char* str) {
     size_t i;
     for (i = 0; i < p->len; i++) {              /* Process input group string */
         /**
          * Try to match range of character between 2 values, such as [0-9]
          * In case p->str[i] == '-', check if left and right are range values
          */
-        if (match_class_range(&p->str[i], p->len - i, str)) {
+        if (match_class_range(r, &p->str[i], p->len - i, str)) {
             return 1;
         }
 
@@ -408,7 +360,7 @@ match_class_char(const p_t* p, const char* str) {
         else if (p->str[i] == '\\') {
             i++;
             if (IS_SPECIAL_META_CHAR(p->str[i])) {  /* Check special characters */
-                if (match_special_char(p, p->str[i], str)) {
+                if (match_special_char(r, p, p->str[i], str)) {
                     return 1;
                 }
             } else if (p->str[i] == *str) {     /* Maybe it was escaped direct character such as .+- */
@@ -439,13 +391,13 @@ match_class_char(const p_t* p, const char* str) {
  * \return          1 if match, 0 otherwise
  */
 static uint8_t
-match_one_char(const p_t* p, const char* str) {
+match_one_char(regex_t* r, const p_t* p, const char* str) {
     if (p->type == P_DOT) {                     /* Match any character */
         return 1;                               /* This one was successful */
     } else if (p->type == P_CHAR_CLASS) {       /* Match character class such [a-zA-Z0-9] */
-        return match_class_char(p, str);
+        return match_class_char(r, p, str);
     } else if (p->type == P_CHAR_CLASS_NOT) {   /* Match character class such as [^a-zA-Z0-9] */
-        return !match_class_char(p, str);
+        return !match_class_char(r, p, str);
     } else {
         return p->ch == *str;
     }
@@ -456,15 +408,16 @@ match_one_char(const p_t* p, const char* str) {
  * \brief           Matches char sequence
  * \param[in]       p: Pointer to current pattern holding char sequence
  * \param[in]       str: Input string to match sequence
+ * \param[in]       con: 1 to continue to match next pattern, 0 to just return status of match
  * \return          1 if match, 0 otherwise
  */
 static uint8_t
-match_char_sequence(const p_t* p, const char* str) {
+match_char_sequence(regex_t* r, const p_t* p, const char* str, uint8_t cont) {
     size_t i;
     const char* s = str;
 
     /**
-     * go throught entire char sequence string and process:
+     * go through entire char sequence string and process:
      *  - Check if end of matching string
      *  - Check if we have escape string, in this case move to next one before compare
      *  - Compare actual char by char and check if there is a match
@@ -486,38 +439,50 @@ match_char_sequence(const p_t* p, const char* str) {
      * If we have a match, proceed with next check
      */
     if (i == p->len) {                          /* All characters matched? */
-        return match_pattern(p + 1, s, 1);      /* Continue with matched source */
+        return cont ? match_pattern(r, p + 1, s, 1) : 1;/* Continue with matched source or just return positive result */
     }
     return 0;                                   /* No match here! */
 }
 
 /**
  * \brief           Match pattern range with {min,max} values, such as [0-9]{1,2} or similar
+ * \note            It can match only single char or char sequence
  * \param[in]       p: Pointer to current pattern to test for
  * \param[in]       str: Pointer to string to test
  * \return          1 if match, 0 otherwise
  */
 static uint8_t
-match_pattern_range(const p_t* p, const char* str) {
+match_pattern_range(regex_t* r, const p_t* p, const char* str) {
     int16_t cnt = 0;
     const char* s = str;
     
     /**
      * Process entire string and check for matches
      */
-    while (cnt < p->max && *s && match_one_char(p, s)) {
-        cnt++;
-        s++;
-        if (p[1].type != P_EMPTY) {
-            if (match_pattern(p + 1, s, 0)) {
+    while (cnt < p->max && *s) {                /* Process entire string or while we didn't reach maximum */
+        if (p->type == P_CHAR_SEQUENCE) {       /* Check for char sequence */
+            if (!match_char_sequence(r, p, s, 0)) { /* Try to match char sequence, but do not continue with other matches if there is a match */
+                break;                          /* Stop execution when failed */
+            }
+            s += p->len;                        /* Increase character pointer for next entry by length of sequence */
+        } else {                                /* Try to match single char only */
+            if (!match_one_char(r, p, s)) {     /* Process with match */
+                break;
+            }
+            s++;
+        }
+
+        cnt++;                                  /* Count number of matches */
+        if (p[1].type != P_EMPTY) {             /* If last one is ont empty */
+            if (match_pattern(r, p + 1, s, 0)) {/* Match next one */
                 break;
             }
         }
     }
-    if (cnt >= p->min && cnt <= p->max) {
-        return (p[1].type != P_EMPTY) ? match_pattern(p + 1, s, 1) : 1;
+    if (cnt >= p->min && cnt <= p->max) {       /* Now check how many entries we have */
+        return (p[1].type != P_EMPTY) ? match_pattern(r, p + 1, s, 1) : 1;  /* We are in valid range */
     }
-    return 0;
+    return 0;                                   /* Invalid match */
 }
 
 /**
@@ -528,7 +493,7 @@ match_pattern_range(const p_t* p, const char* str) {
  * \return          1 if match, 0 otherwise
  */
 static uint8_t
-match_pattern(const p_t* p, const char* str, uint8_t prev_result) {
+match_pattern(regex_t* r, const p_t* p, const char* str, uint8_t prev_result) {
     const char* s = str;
     uint8_t result = 0, ret = 0;
     do {
@@ -558,14 +523,14 @@ match_pattern(const p_t* p, const char* str, uint8_t prev_result) {
          * It matches STAR and PLUS patterns, set by pattern compilation
          */
         else if (p->min || p->max) {
-            result = match_pattern_range(p, s);
+            result = match_pattern_range(r, p, s);
             ret = 1;
         }
         /**
          * Match exact char sequence between pattern and source string
          */
         else if (p[0].type == P_CHAR_SEQUENCE) {
-            result = match_char_sequence(p, s);
+            result = match_char_sequence(r, p, s, 1);
             ret = 1;
         }
         /**
@@ -591,7 +556,7 @@ match_pattern(const p_t* p, const char* str, uint8_t prev_result) {
             }
             return result;                      /* Invalid result and no OR next = error */
         }
-        if (*s && match_one_char(p, s)) {       /* Try to match single character */
+        if (*s && match_one_char(r, p, s)) {    /* Try to match single character */
             p++;                                /* Go to next pattern */
             s++;                                /* Go to next character */
             prev_result = 1;                    /* Set to valid result in case next one is OR */
@@ -607,27 +572,27 @@ match_pattern(const p_t* p, const char* str, uint8_t prev_result) {
 }
 
 static void
-print_pattern(void) {
+print_pattern(regex_t* p) {
     size_t i = 0, len;
-    for (; patterns[i].type != P_EMPTY; i++) {
-        switch (patterns[i].type) {
+    for (; p->p[i].type != P_EMPTY; i++) {
+        switch (p->p[i].type) {
             case P_CHAR_CLASS:
             case P_CHAR_CLASS_NOT:
                 printf("Char class: \"");
-                for (len = 0; len < patterns[i].len; len++) {
-                    printf("%c", patterns[i].str[len]);
+                for (len = 0; len < p->p[i].len; len++) {
+                    printf("%c", p->p[i].str[len]);
                 }
                 printf("\"\r\n");
                 break;
             case P_CHAR_SEQUENCE:
                 printf("Char sequence: \"");
-                for (len = 0; len < patterns[i].len; len++) {
-                    printf("%c", patterns[i].str[len]);
+                for (len = 0; len < p->p[i].len; len++) {
+                    printf("%c", p->p[i].str[len]);
                 }
                 printf("\"\r\n");
                 break;
             case P_CHAR:
-                printf("Char: %c\r\n", patterns[i].ch);
+                printf("Char: %c\r\n", p->p[i].ch);
                 break;
             case P_OR:
                 printf("OR\r\n");
@@ -643,35 +608,55 @@ print_pattern(void) {
  */
 
 /**
+ * \brief           Prepare and compile pattern before it can be used for matching
+ * \param[in]       r: Pointer to empty \ref regex_t structure for matching
+ * \param[in]       pattern: Pointer to pattern string
+ * \param[in]       p: Pointer to array to hold patterns data to
+ * \param[in]       p_len: Size of array for patterns
+ * \return          1 on success, 0 otherwise
+ */
+uint8_t
+regex_prepare(regex_t* r, const char* pattern, regex_pattern_t* p, size_t p_len) {
+    size_t len;
+
+    r->p = p;                                   /* Save pointer to pattern array */
+    r->p_totlen = p_len;                        /* Save total length of array available to use */
+    r->p_len = 0;                               /* Reset number of currently used patterns */
+
+    if (!analyze_pattern(r, &pattern, &len)) {  /* Analyze pattern and make sure it is in correct format */
+        return 0;
+    }
+
+    if (!compile_pattern(r, pattern, len)) {    /* Try to compile pattern */
+        return 0;
+    }
+    return 1;
+}
+
+/**
  * \brief           Check if string and pattern matches, public API function
  * \param[in]       pattern: Pattern to check in string
  * \param[in]       str: Pointer to input string to make match on
  * \return          1 on match, 0 otherwise
  */
 uint8_t
-regex_match(const char* pattern, const char* str) {
-    size_t len;
-    if (!analyze_pattern(&pattern, &len)) {     /* Analyze pattern and make sure it is in correct format */
-        return 0;
-    }
+regex_match(regex_t* r, const char* str, regex_match_t* matches, size_t m_len) {
+    p_t* p;
+    uint8_t anc;
 
-    if (!compile_pattern(pattern, len)) {       /* Try to compile pattern */
-        return 0;
-    }
+    print_pattern(r);                           /* Print for debug purpose */
+    
+    p = r->p;                                   /* Set start pattern */
+    anc = p->type == P_BEGIN ? (p++, 1) : 0;    /* Check if string must start with anchor */
 
-    print_pattern();                            /* Print for debug purpose */
+    r->matches = matches;                       /* Set matching pointer */
+    r->m_totlen = m_len;                        /* Set total length of available matching */
+    r->m_len = 0;                               /* Reset number of used end matching arrays */
 
-    /**
-     * If pattern to start string at beginning was found, 
-     * use it immediatelly otherwise process all possible matches and return on first found
-     */
-    if (patterns[0].type == P_BEGIN) {          /* Match beginning of string directly if necessary */
-        return match_pattern(&patterns[1], str, 0); /* Directly start with matching next  */
-    }                                           
     do {
-        if (match_pattern(patterns, str, 0)) {  /* Simply process entire string, even if it is NULL */
+        if (match_pattern(r, p, str, 0)) {      /* Simply process entire string, even if it is NULL */
             return 1;                           /* Match was found */
         }
-    } while (*str++);                           /* Start from all the angles until string is valid */
+    } while (*str++ && !anc);                   /* Start from all the angles until string is valid */
     return 0;                                   /* Ooops, no match found! */
 }
