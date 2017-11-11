@@ -98,6 +98,7 @@ static uint8_t match_pattern(regex_t* r, const p_t* p, const char* str, uint8_t 
 #define IS_W_CHAR(x)            (((x) >= 'a' && (x) <= 'z') || ((x) >= 'A' && (x) <= 'Z') || ((x) >= '0' && (x) <= '9') || (x) == '_')
 #define IS_C_UPPER(x)           ((x) >= 'A' && (x) <= 'Z')
 #define CHAR_TO_NUM(x)          ((x) - '0')
+#define CAN_MATCH_MORE(p)       (!((p[1].type == P_EMPTY) || (p[1].type == P_CAPTURE_END && p[2].type == P_EMPTY)))
 
 /**
  * \brief           Compiles input pattern to library valid entries
@@ -118,13 +119,49 @@ compile_pattern(regex_t* r, const char* p, size_t len) {
             case '^': patterns[i].type = P_BEGIN; break;
             case '$': patterns[i].type = P_END; break;
             case '.': patterns[i].type = P_DOT; break;
-            case '*': if (i > 0) { patterns[i - 1].min = 0; patterns[i - 1].max = RANGE_MAX; goto ignore; } break;
-            case '+': if (i > 0) { patterns[i - 1].min = 1; patterns[i - 1].max = RANGE_MAX; goto ignore; } break;
-            case '?': patterns[i].type = P_QM; break;
+            case '*':
+                if (i > 1 && (patterns[i - 1].type == P_CAPTURE_START || patterns[i - 1].type == P_CAPTURE_END)) {
+                    patterns[i - 2].min = 0;
+                    patterns[i - 2].max = RANGE_MAX;
+                    goto ignore;
+                } else if (i > 0) {
+                    patterns[i - 1].min = 0;
+                    patterns[i - 1].max = RANGE_MAX;
+                    goto ignore;
+                }
+                break;
+            case '+':
+                if (i > 1 && (patterns[i - 1].type == P_CAPTURE_START || patterns[i - 1].type == P_CAPTURE_END)) {
+                    patterns[i - 2].min = 1;
+                    patterns[i - 2].max = RANGE_MAX;
+                    goto ignore;
+                } else if (i > 0) {
+                    patterns[i - 1].min = 1;
+                    patterns[i - 1].max = RANGE_MAX;
+                    goto ignore;
+                }
+                break;
+            //case '?': patterns[i].type = P_QM; break;
+            case '?':
+                if (i > 1 && (patterns[i - 1].type == P_CAPTURE_START || patterns[i - 1].type == P_CAPTURE_END)) {
+                    patterns[i - 2].min = 0;
+                    patterns[i - 2].max = 1;
+                    goto ignore;
+                } else if (i > 0) {
+                    patterns[i - 1].min = 0;
+                    patterns[i - 1].max = 1;
+                    goto ignore;
+                }
+                break;
             case '|': patterns[i].type = P_OR; break;
             case '(':
+                //goto ignore;
+                patterns[i].type = P_CAPTURE_START; /* Start of capturing group */
+                break;
             case ')':
-                goto ignore;                    /* Ignore currently */
+                //goto ignore;
+                patterns[i].type = P_CAPTURE_END;   /* End of capturing group */
+                break;
             case '\\': {                        /* Escape character */
                 PTR_INC();                      /* Go to next character */
                 switch (*p) {
@@ -196,7 +233,12 @@ compile_pattern(regex_t* r, const char* p, size_t len) {
                 }
                 /* Process forward to default */
                 if (type && i) {
-                    p_t* pattern = &patterns[i - 1];
+                    p_t* pattern;
+                    if (i > 1 && (patterns[i - 1].type == P_CAPTURE_START || patterns[i - 1].type == P_CAPTURE_END)) {
+                        pattern = &patterns[i - 2];
+                    } else {
+                        pattern = &patterns[i - 1];
+                    }
                     while (p != tmp) {          /* Do it until they are not the same */
                         PTR_INC();              /* Increase input string */
                     }
@@ -216,16 +258,14 @@ compile_pattern(regex_t* r, const char* p, size_t len) {
                     patterns[i].len = 1;
                     while ((len - 1) && *p) {   /* Process much as possible */
                         /* All special one except '[' */
-                        if (IS_SPECIAL_MOD_CHAR(p[2])) {    /* In case second after current is special, stop with sequnce */
-                            break;
-                        }
-                        if (IS_SPECIAL_CHAR(p[1])) {    /* Check if next character is special one */
-                            break;
-                        }
                         if (p[1] == '\\') {    /* Is next one escape character? */
                             if (IS_SPECIAL_META_CHAR(p[2])) {   /* Is escape followed by meta character? */
                                 break;
                             }
+                        } else if (IS_SPECIAL_MOD_CHAR(p[2])) { /* In case second after current is special, stop with sequnce */
+                            break;
+                        } else if (p[0] != '\\' && IS_SPECIAL_CHAR(p[1])) { /* Check if next character is special one */
+                            break;
                         }
                         patterns[i].len++;      /* Increase length of char sequence */
                         PTR_INC();              /* Go to next character */
@@ -241,7 +281,7 @@ ignore:
         PTR_INC();
     }
     patterns[i].type = P_EMPTY;                 /* Last pattern is always empty */
-    r->m_len = i + 1;                           /* Set total length used */
+    r->p_len = i + 1;                           /* Set total length used */
     return 1;
 }
 
@@ -473,14 +513,16 @@ match_pattern_range(regex_t* r, const p_t* p, const char* str) {
         }
 
         cnt++;                                  /* Count number of matches */
-        if (p[1].type != P_EMPTY) {             /* If last one is ont empty */
-            if (match_pattern(r, p + 1, s, 0)) {/* Match next one */
-                break;
+        if (CAN_MATCH_MORE(p)) {                /* If last one is ont empty */
+            if (match_pattern(r, p + 1, s, 0)) {/* Match next one? */
+                if (cnt >= p->min) {
+                    break;
+                }
             }
         }
     }
     if (cnt >= p->min && cnt <= p->max) {       /* Now check how many entries we have */
-        return (p[1].type != P_EMPTY) ? match_pattern(r, p + 1, s, 1) : 1;  /* We are in valid range */
+        return CAN_MATCH_MORE(p) ? match_pattern(r, p + 1, s, 1) : 1;   /* We are in valid range */
     }
     return 0;                                   /* Invalid match */
 }
@@ -507,6 +549,20 @@ match_pattern(regex_t* r, const p_t* p, const char* str, uint8_t prev_result) {
                 p++;                            /* Previous check was failed, try with next after OR */
             }
             continue;                           /* Ignore other execution and start over */
+        }
+
+        if (p->type == P_CAPTURE_START) {
+            //printf("Capture start!\r\n");
+            //r->matches[r->m_len].s = s;
+            //r->matches[r->m_len].len = 0;
+            p++;
+            continue;
+        } else if (p->type == P_CAPTURE_END) {
+            //printf("Capture end!\r\n");
+            //r->matches[r->m_len].len = s - r->matches[r->m_len].s;
+            //r->m_len++;
+            p++;
+            continue;
         }
 
         /**
@@ -567,13 +623,14 @@ match_pattern(regex_t* r, const p_t* p, const char* str, uint8_t prev_result) {
             }
             break;                              /* Stop loop */
         }
-    } while (1);   /* Infinite loop */
+    } while (1);                                /* Infinite loop */
     return 0;                                   /* No match at all found */
 }
 
 static void
 print_pattern(regex_t* p) {
     size_t i = 0, len;
+
     for (; p->p[i].type != P_EMPTY; i++) {
         switch (p->p[i].type) {
             case P_CHAR_CLASS:
@@ -582,20 +639,26 @@ print_pattern(regex_t* p) {
                 for (len = 0; len < p->p[i].len; len++) {
                     printf("%c", p->p[i].str[len]);
                 }
-                printf("\"\r\n");
+                printf("\"; Min: %d, Max: %d\r\n", (int)p->p[i].min, (int)p->p[i].max);
                 break;
             case P_CHAR_SEQUENCE:
                 printf("Char sequence: \"");
                 for (len = 0; len < p->p[i].len; len++) {
                     printf("%c", p->p[i].str[len]);
                 }
-                printf("\"\r\n");
+                printf("\"; Min: %d, Max: %d\r\n", (int)p->p[i].min, (int)p->p[i].max);
                 break;
             case P_CHAR:
-                printf("Char: %c\r\n", p->p[i].ch);
+                printf("Char: %c; Min: %d, Max: %d\r\n", p->p[i].ch, (int)p->p[i].min, (int)p->p[i].max);
                 break;
             case P_OR:
                 printf("OR\r\n");
+                break;
+            case P_CAPTURE_START:
+                printf("CAPTURE_START\r\n");
+                break;
+            case P_CAPTURE_END:
+                printf("CAPTURE_END\r\n");
                 break;
             default:
                 break;
